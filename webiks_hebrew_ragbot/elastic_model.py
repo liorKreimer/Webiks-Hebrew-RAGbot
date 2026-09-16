@@ -151,6 +151,59 @@ class ElasticModel:
         return results
 
 
+    def search_hybrid(self, embedded_search: list[float], query_text: str, size=50, rrf_k=60,
+                       dense_weight=2.0, bm25_weight=1.0) -> list[dict]:
+        """
+        Hybrid retrieval: fuses the existing dense cosine-similarity search with a
+        BM25 lexical search on the embedded field's source text, via weighted
+        Reciprocal Rank Fusion (RRF). Targets the failure mode of pure dense
+        retrieval where a rare, specific term (e.g. a named medical procedure) gets
+        diluted by generic topical similarity to unrelated documents.
+
+        RRF avoids needing to normalize BM25's unbounded scores against cosine
+        similarity's bounded range: each list contributes weight/(rrf_k + rank) per
+        document, summed across lists. rrf_k=60 is the standard constant from the
+        original RRF paper.
+
+        dense_weight/bm25_weight default to 2:1 rather than plain unweighted RRF
+        (1:1). An earlier unweighted version was tried and evaluated first (see
+        EVALUATION_METHODOLOGY.md): it raised Recall@3 nicely but also reshuffled
+        many already-correct rank-1 dense hits down to rank 2-3 (hurting MRR/NDCG),
+        and on long natural-language questions BM25's OR-across-terms matching can
+        hit the majority of the corpus (diluting its own signal) since it isn't
+        weighted toward rarer terms. Weighting dense higher keeps BM25 as a
+        tie-breaking nudge for the specific-term cases it's actually good at,
+        without letting it override dense's otherwise-correct top choice as often.
+
+        Returns results in the same shape as search() (a list of ES hit dicts with
+        "_source"), so callers don't need to change.
+        """
+        dense_hits = self.search(embedded_search, size=size)
+
+        bm25_body = {
+            "size": size,
+            "query": {
+                "match": {
+                    definitions_singleton.field_to_embed: query_text
+                }
+            }
+        }
+        bm25_results = self.es_client.search(index=EMBEDDING_INDEX + "*", body=bm25_body)
+        bm25_hits = bm25_results["hits"]["hits"]
+
+        identifier = definitions_singleton.identifier
+        fused_scores = {}
+        hit_by_doc_id = {}
+        for ranked_list, weight in ((dense_hits, dense_weight), (bm25_hits, bm25_weight)):
+            for rank, hit in enumerate(ranked_list, start=1):
+                doc_id = hit["_source"][identifier]
+                fused_scores[doc_id] = fused_scores.get(doc_id, 0.0) + weight / (rrf_k + rank)
+                hit_by_doc_id.setdefault(doc_id, hit)
+
+        ranked_doc_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
+        return [hit_by_doc_id[doc_id] for doc_id in ranked_doc_ids[:size]]
+
+
 es_model = None
 
 

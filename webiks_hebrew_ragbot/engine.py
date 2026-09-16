@@ -110,7 +110,10 @@ class Engine:
                list: A list of top k documents.
            """
         query_embeddings = self.retrieval_model.encode(query)
-        all_docs = self.elastic_model.search(query_embeddings)
+        if config.RETRIEVAL_MODE == "hybrid":
+            all_docs = self.elastic_model.search_hybrid(query_embeddings, query_text=query)
+        else:
+            all_docs = self.elastic_model.search(query_embeddings)
         top_k_documents = []
         top_doc_ids = []
 
