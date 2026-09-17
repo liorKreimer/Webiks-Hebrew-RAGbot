@@ -103,6 +103,12 @@ class Engine:
     def search_documents(self, query: str, top_k: int):
         """
            Searches for documents based on the query and returns the top_k results.
+
+           Retrieval mode is controlled by config.RETRIEVAL_MODE: "hybrid" fuses the
+           dense search with a BM25 lexical search via weighted Reciprocal Rank Fusion
+           (see ElasticModel.search_hybrid); any other value (default "dense") uses the
+           original cosine-similarity-only search, unchanged.
+
            Args:
                query (str): The query string.
                top_k (int): The number of top documents to return.
@@ -110,7 +116,7 @@ class Engine:
                list: A list of top k documents.
            """
         query_embeddings = self.retrieval_model.encode(query)
-        if config.RETRIEVAL_MODE == "hybrid":
+        if config.RETRIEVAL_MODE == config.RETRIEVAL_MODE_HYBRID:
             all_docs = self.elastic_model.search_hybrid(query_embeddings, query_text=query)
         else:
             all_docs = self.elastic_model.search(query_embeddings)
@@ -118,9 +124,10 @@ class Engine:
         top_doc_ids = []
 
         for doc in all_docs:
-            if doc["_source"]["doc_id"] not in top_doc_ids:
+            doc_id = doc["_source"][self.identifier_field]
+            if doc_id not in top_doc_ids:
                 top_k_documents.append(doc["_source"])
-                top_doc_ids.append(doc["_source"]["doc_id"])
+                top_doc_ids.append(doc_id)
             if len(top_doc_ids) >= top_k:
                 break
 

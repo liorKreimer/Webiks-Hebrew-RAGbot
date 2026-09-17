@@ -1,12 +1,10 @@
 from unittest.mock import MagicMock, ANY, patch
-import sys
 import os
 import importlib
+import pytest
 from elasticsearch import Elasticsearch
 from pathlib import Path
 import builtins
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
 
 project_root = Path(__file__).parent.parent
 fake_config_path = project_root / "example-conf.json"
@@ -18,7 +16,7 @@ class ElasticSetup:
                 patch.object(builtins, "open", create=True) as mock_open:
             mock_open.return_value.__enter__.return_value.read.return_value = "{\"identifier_field\": \"doc_id\", \"saved_fields\": {\"title\": \"text\", \"doc_id\": \"integer\", \"link\": \"text\", \"content\": \"text\"}, \"field_for_llm\": \"content\", \"model_name\": \"Webiks_Hebrew_RAGbot_KolZchut_QA_Embedder_v1.0\", \"field_to_embed\": \"content\"}"
 
-            elastic_model_module = importlib.import_module("ragbot.elastic_model")
+            elastic_model_module = importlib.import_module("webiks_hebrew_ragbot.elastic_model")
         return (
             elastic_model_module.ElasticModel,
             elastic_model_module.index_from_doc_id,
@@ -83,11 +81,11 @@ def test_search():
             "script_score": {
                 "query": {
                     "exists": {
-                        "field": 'content_Webiks_KolZchut_QA_Embedder_v1.0_vectors'
+                        "field": 'content_Webiks_Hebrew_RAGbot_KolZchut_QA_Embedder_v1.0_vectors'
                     }
                 },
                 "script": {
-                    "source": "cosineSimilarity(params.query_vector, 'content_Webiks_KolZchut_QA_Embedder_v1.0_vectors') + 1.0",
+                    "source": "cosineSimilarity(params.query_vector, 'content_Webiks_Hebrew_RAGbot_KolZchut_QA_Embedder_v1.0_vectors') + 1.0",
                     "params": {"query_vector": embedded_search}
                 }
             }
@@ -97,3 +95,55 @@ def test_search():
         index=EMBEDDING_INDEX + "*", body=expected_output_from_es
     )
     assert search_results == [{"_id": "1", "_source": {"content": "value1"}}]
+
+
+def test_search_hybrid_rrf_fusion_orders_by_combined_rank():
+    es_mock = MagicMock(spec=Elasticsearch)
+    model = ElasticModel(es_mock)
+    # doc 1 is dense-only at rank 1; doc 2 is bm25-only at rank 1 -> both get the
+    # same single best-rank contribution from their respective list, weighted 2:1.
+    model.search = MagicMock(return_value=[{"_source": {"doc_id": 1}}])
+    es_mock.search.return_value = {"hits": {"hits": [{"_source": {"doc_id": 2}}]}}
+
+    results = model.search_hybrid([0.1, 0.2, 0.3], query_text="q")
+
+    assert [hit["_source"]["doc_id"] for hit in results] == [1, 2]
+    assert results[0]["_score"] == pytest.approx(2.0 / 61)
+    assert results[1]["_score"] == pytest.approx(1.0 / 61)
+
+
+def test_search_hybrid_dedupes_paragraph_level_hits_before_rrf():
+    """
+    A page indexed as multiple paragraphs can appear more than once in the same
+    ranked list. RRF must take each document's single best rank per list, not sum
+    a contribution per paragraph occurrence - otherwise a page with more indexed
+    paragraphs wins purely from appearing more often, regardless of relevance.
+    """
+    es_mock = MagicMock(spec=Elasticsearch)
+    model = ElasticModel(es_mock)
+    # doc_id=2 is the single best dense hit (rank 1). doc_id=1 only reaches rank 2
+    # and rank 3 (two different paragraphs of the same page). Correct RRF, using
+    # doc_id=1's best rank (2) only, must still rank doc_id=2 first.
+    model.search = MagicMock(return_value=[
+        {"_source": {"doc_id": 2}},
+        {"_source": {"doc_id": 1}},
+        {"_source": {"doc_id": 1}},
+    ])
+    es_mock.search.return_value = {"hits": {"hits": []}}
+
+    results = model.search_hybrid([0.1, 0.2, 0.3], query_text="q")
+
+    assert [hit["_source"]["doc_id"] for hit in results] == [2, 1]
+    assert results[1]["_score"] == pytest.approx(2.0 / 62)
+
+
+def test_search_hybrid_doc_present_in_only_one_list():
+    es_mock = MagicMock(spec=Elasticsearch)
+    model = ElasticModel(es_mock)
+    model.search = MagicMock(return_value=[{"_source": {"doc_id": 5}}])
+    es_mock.search.return_value = {"hits": {"hits": []}}
+
+    results = model.search_hybrid([0.1, 0.2, 0.3], query_text="q")
+
+    assert [hit["_source"]["doc_id"] for hit in results] == [5]
+    assert results[0]["_score"] == pytest.approx(2.0 / 61)

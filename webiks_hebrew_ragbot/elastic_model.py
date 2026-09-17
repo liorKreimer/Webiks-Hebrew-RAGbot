@@ -1,12 +1,10 @@
 import datetime
 import logging
-import os
 from elasticsearch import Elasticsearch
 from .document import document_definition_factory
+from .config import EMBEDDING_INDEX, ES_EMBEDDING_INDEX_LENGTH
 
 definitions_singleton = document_definition_factory()
-EMBEDDING_INDEX = os.getenv("ES_EMBEDDING_INDEX", "embeddings")
-ES_EMBEDDING_INDEX_LENGTH = int(os.getenv("ES_EMBEDDING_INDEX_LENGTH", 1000))
 
 
 def index_from_doc_id(doc_id: int):
@@ -41,6 +39,10 @@ class ElasticModel:
 
         search(embedded_search: dict[str, list[float]], size=50) -> dict[str, list[dict]]:
             Searches for similar documents using cosine similarity based on the provided embedded vectors.
+
+        search_hybrid(embedded_search: list[float], query_text: str, size=50, rrf_k=60, dense_weight=2.0, bm25_weight=1.0) -> list[dict]:
+            Fuses the dense cosine-similarity search with a BM25 lexical search via weighted
+            Reciprocal Rank Fusion. Same return shape/contract as search().
     """
 
     custom_result_selection_function = None
@@ -192,16 +194,34 @@ class ElasticModel:
         bm25_hits = bm25_results["hits"]["hits"]
 
         identifier = definitions_singleton.identifier
+
+        def dedupe_by_doc_id(ranked_list):
+            # dense_hits/bm25_hits are paragraph-level ES hits, so a single doc_id can
+            # appear more than once in the same list (multiple paragraphs of one page).
+            # RRF is defined per document per list, so collapse each list down to one
+            # (best/first-ranked) hit per doc_id before computing rank contributions -
+            # otherwise a page with more indexed paragraphs wins purely from appearing
+            # more often, not from being more relevant.
+            seen = {}
+            for hit in ranked_list:
+                seen.setdefault(hit["_source"][identifier], hit)
+            return list(seen.values())
+
         fused_scores = {}
         hit_by_doc_id = {}
         for ranked_list, weight in ((dense_hits, dense_weight), (bm25_hits, bm25_weight)):
-            for rank, hit in enumerate(ranked_list, start=1):
+            for rank, hit in enumerate(dedupe_by_doc_id(ranked_list), start=1):
                 doc_id = hit["_source"][identifier]
                 fused_scores[doc_id] = fused_scores.get(doc_id, 0.0) + weight / (rrf_k + rank)
                 hit_by_doc_id.setdefault(doc_id, hit)
 
         ranked_doc_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
-        return [hit_by_doc_id[doc_id] for doc_id in ranked_doc_ids[:size]]
+        results = []
+        for doc_id in ranked_doc_ids[:size]:
+            hit = dict(hit_by_doc_id[doc_id])
+            hit["_score"] = fused_scores[doc_id]  # reflects the fused RRF score, not the raw dense/BM25 score
+            results.append(hit)
+        return results
 
 
 es_model = None
